@@ -1,0 +1,12 @@
+{
+  "name": "Kalinga — Division Medical-Dental & Nutrition Information System",
+  "short_name": "Kalinga",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F4F1EA",
+  "theme_color": "#0E2A30",
+  "icons": [
+    { "src": "assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
