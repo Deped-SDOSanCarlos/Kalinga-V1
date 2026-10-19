@@ -1,7 +1,8 @@
 // Kalinga — DepEd Division Medical-Dental & Nutrition Information System
 // App shell, router and screens.
-import { db, uid, getSetting, setSetting, exportAll, importAll, encryptJSON, decryptJSON, audit, requestPersistence, wipeAll } from './db.js';
-import { ROLES, can, createUser, login, logout, currentUser, setPassword, passwordProblem } from './auth.js';
+import { db, sb, configured, uid, getSetting, setSetting, loadSettings as fetchSettings, exportAll, importAll, readLegacyLocal, encryptJSON, decryptJSON, audit, readAudit, ConflictError } from './db.js';
+import { ROLES, can, login, logout, currentUser, currentSession, systemStatus, setupFirstAdmin, joinWithInvite, inviteInfo, listUsers, listStaffNames, updateUser, adminSetPassword, changeOwnPassword, createInvite, listInvites, revokeInvite, inviteLink } from './auth.js';
+import { SUPABASE_URL } from './config.js';
 import { FORMS, formById, formsFor, allFields, PERSON_FIELDS, fullName, ageAt, ageText, currentSchoolYear, withComputed, missingRequired, bmi, adultBmiClass, NUTRITION_STATUS, toothIndex } from './forms.js';
 import { renderEditor, bindEditor, collect, applyValues, renderPrint } from './render.js';
 import { loadAll, computeStats, perSchool, monthlyCounts, barList, columns } from './stats.js';
@@ -19,26 +20,36 @@ async function boot() {
   document.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k' && state.user) { e.preventDefault(); commandPalette(); }
   });
+  window.addEventListener('unhandledrejection', (e) => toast(e.reason?.message || String(e.reason), 'err', 6000));
+  if (!configured) return notConfiguredScreen();
   try {
-    if (!(await db.count('users'))) return setupScreen();
-    state.user = await currentUser();
-    if (!state.user) return loginScreen();
+    const join = location.hash.match(/^#\/join\/([0-9a-f-]{36})$/i);
+    if (join) return joinScreen(join[1]);
+    const status = await systemStatus();
+    state.division = status.division || '';
+    if (!status.has_admin) return setupScreen();
+    const s = await currentSession();
+    if (s?.pending) return pendingScreen(s.pending);
+    if (s?.inactive) { await sb.auth.signOut(); toast('Your account has been disabled. Contact the division administrator.', 'err', 8000); return loginScreen(); }
+    if (!s?.user) return loginScreen();
+    state.user = s.user;
     await startApp();
   } catch (err) {
-    app.innerHTML = `<div class="boot"><p class="err">Kalinga could not open its database.<br><small>${esc(err.message)}</small></p><p class="muted">Private/incognito windows and some browser privacy settings block local storage.</p></div>`;
+    app.innerHTML = `<div class="boot"><p class="err">Kalinga could not reach its database.<br><small>${esc(err.message)}</small></p><p class="muted">Check the internet connection, then <a href="">reload</a>. If this keeps happening, the administrator should check that the Supabase project is running.</p></div>`;
   }
 }
 
-async function loadSettings() {
-  const rows = await db.all('settings');
-  state.settings = Object.fromEntries(rows.filter((r) => r.key !== 'apiKey').map((r) => [r.key, r.value]));
-  state.hasKey = rows.some((r) => r.key === 'apiKey' && r.value);
+async function loadSettings(force = false) {
+  const all = await fetchSettings(force);
+  const { apiKey, ...rest } = all;
+  state.settings = rest;
+  state.hasKey = !!apiKey;
   state.schools = [...(await db.all('schools'))].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 async function startApp() {
   await loadSettings();
-  requestPersistence();
+  state.checkedAt = Date.now();
   renderShell();
   let lastHash = location.hash;
   window.onhashchange = () => {
@@ -82,66 +93,125 @@ function authLayout(inner) {
 }
 const logoMark = () => `<img src="assets/icon.svg" alt="" width="36" height="36">`;
 
+function notConfiguredScreen() {
+  authLayout(`
+    <div class="auth-card">
+      <p class="eyebrow">Almost there</p>
+      <h2>Connect the central database</h2>
+      <p class="muted">This copy of Kalinga is not yet connected to the division's Supabase database. The administrator needs to:</p>
+      <ol class="steps">
+        <li>Create a free project at <b>supabase.com</b>.</li>
+        <li>Run <code>supabase/schema.sql</code> in the project's SQL Editor.</li>
+        <li>Put the project URL and anon key in <code>js/config.js</code> and upload it to GitHub.</li>
+      </ol>
+      <p class="muted small">Step-by-step instructions are in the README.</p>
+    </div>`);
+}
+
+// Runs a form submit handler with the button disabled and errors shown as toasts.
+function busySubmit(form, fn) {
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    if (!form.reportValidity()) return;
+    const btn = form.querySelector('button[type=submit]');
+    const label = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Please wait…';
+    try { await fn(Object.fromEntries(new FormData(form))); } catch (err) { toast(err.message, 'err', 7000); } finally { btn.disabled = false; btn.innerHTML = label; }
+  };
+}
+
+async function enterApp(user) {
+  state.user = user;
+  history.replaceState(null, '', location.pathname + '#/dashboard');
+  await startApp();
+}
+
 function setupScreen() {
   authLayout(`
-    <form class="auth-card" id="setup" novalidate>
+    <form class="auth-card" id="setup">
       <p class="eyebrow">First-time setup</p>
       <h2>Set up your division</h2>
-      <p class="muted">Create the administrator / developer account. Doctors, dentists and nurses are added later under Users.</p>
+      <p class="muted">Create the administrator / developer account. Doctors, dentists and nurses join later through invite links.</p>
       <div class="grid2">
         <label>Region<input name="region" list="regions" required placeholder="e.g. Region III – Central Luzon"></label>
         <label>Schools Division of<input name="division" required placeholder="e.g. Tarlac Province"></label>
       </div>
       <datalist id="regions">${REGIONS.map((r) => `<option value="${esc(r)}">`).join('')}</datalist>
       <label>Full name<input name="fullName" required autocomplete="name"></label>
-      <div class="grid2">
-        <label>Username<input name="username" required autocomplete="username" pattern="[A-Za-z0-9._\\-]{3,32}"></label>
-        <label>Password<input name="password" type="password" required autocomplete="new-password" minlength="8"></label>
-      </div>
+      <label>Email<input name="email" type="email" required autocomplete="email" placeholder="you@deped.gov.ph"></label>
+      <label>Password<input name="password" type="password" required autocomplete="new-password" minlength="8"></label>
       <button class="btn primary block" type="submit">Create administrator ${icon('arrowRight')}</button>
-      <button class="btn ghost block" type="button" id="restore">${icon('upload')} Restore from a Kalinga backup instead</button>
     </form>`);
-  $('#setup').onsubmit = async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    if (!f.reportValidity()) return;
-    try {
-      const v = Object.fromEntries(new FormData(f));
-      const user = await createUser({ username: v.username, fullName: v.fullName, role: 'admin', password: v.password, position: 'Administrator / Developer' });
-      await setSetting('region', v.region.trim());
-      await setSetting('division', v.division.trim());
-      await setSetting('unit', 'School Health and Nutrition Unit');
-      await login(user.username, v.password);
-      state.user = await currentUser();
-      toast('Division set up. Welcome to Kalinga!');
-      location.hash = '#/settings';
-      await startApp();
-    } catch (err) { toast(err.message, 'err', 5000); }
-  };
-  $('#restore').onclick = () => restoreBackup(true);
+  busySubmit($('#setup'), async (v) => {
+    const user = await setupFirstAdmin(v);
+    state.user = user;
+    await setSetting('region', v.region.trim());
+    await setSetting('division', v.division.trim());
+    await setSetting('unit', 'School Health and Nutrition Unit');
+    await audit(user, 'setup', 'first administrator');
+    toast('Division set up. Welcome to Kalinga!');
+    history.replaceState(null, '', location.pathname + '#/settings');
+    await startApp();
+  });
 }
 
 function loginScreen() {
   authLayout(`
     <form class="auth-card" id="login">
-      <p class="eyebrow">Sign in</p>
+      <p class="eyebrow">Sign in${state.division ? ` · SDO ${esc(state.division)}` : ''}</p>
       <h2>${greeting()}!</h2>
-      <p class="muted">Sign in with the account your division administrator gave you.</p>
-      <label>Username<input name="username" required autocomplete="username" autofocus></label>
+      <p class="muted">Sign in with your Kalinga account. New staff: open the invite link your administrator sent you.</p>
+      <label>Email<input name="email" type="email" required autocomplete="email" autofocus></label>
       <label>Password<input name="password" type="password" required autocomplete="current-password"></label>
       <button class="btn primary block" type="submit">Sign in ${icon('arrowRight')}</button>
-      <p class="muted small">${icon('lock')} Accounts and records are stored on this device. Ask your administrator for a backup file to use Kalinga on another computer.</p>
+      <p class="muted small">${icon('lock')} Records are kept in the division's central database. Forgot your password? Ask the administrator to set a temporary one.</p>
     </form>`);
-  $('#login').onsubmit = async (e) => {
-    e.preventDefault();
-    const v = Object.fromEntries(new FormData(e.target));
-    const btn = e.target.querySelector('button');
-    btn.disabled = true;
-    try {
-      state.user = await login(v.username, v.password);
-      await startApp();
-    } catch (err) { toast(err.message, 'err'); btn.disabled = false; }
-  };
+  busySubmit($('#login'), async (v) => {
+    const s = await login(v.email, v.password);
+    if (s?.pending) return pendingScreen(s.pending);
+    if (s?.inactive) { await sb.auth.signOut(); throw new Error('Your account has been disabled. Contact the division administrator.'); }
+    await enterApp(s.user);
+  });
+}
+
+async function joinScreen(token) {
+  authLayout('<div class="auth-card"><div class="loading"><span></span><span></span><span></span></div></div>');
+  const info = await inviteInfo(token);
+  if (!info || !info.valid) {
+    authLayout(`<div class="auth-card"><p class="eyebrow">Invite link</p><h2>This link can’t be used</h2>
+      <p class="muted">${info ? 'It has already been used, was revoked, or has expired.' : 'The link is incomplete or invalid.'} Ask the division administrator for a new invite link.</p>
+      <a class="btn block" href="${location.pathname}">Go to sign in</a></div>`);
+    return;
+  }
+  const clinician = ['doctor', 'dentist'].includes(info.role);
+  authLayout(`
+    <form class="auth-card" id="join">
+      <p class="eyebrow">You’re invited${info.division ? ` · SDO ${esc(info.division)}` : ''}</p>
+      <h2>Join Kalinga as <em>${esc(ROLES[info.role].label)}</em></h2>
+      <p class="muted">Create your account. You will use this email and password to sign in from any computer or phone.</p>
+      <label>Full name (as printed on forms)<input name="fullName" required autocomplete="name"></label>
+      <label>Email<input name="email" type="email" required autocomplete="email" value="${esc(info.email || '')}" ${info.email ? 'readonly' : ''}></label>
+      <label>Password<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>
+      <div class="grid2">
+        <label>PRC license no.${clinician ? ' <b class="req">*</b>' : ''}<input name="license" ${clinician ? 'required' : ''}></label>
+        <label>Position<input name="position" placeholder="e.g. Nurse II"></label>
+      </div>
+      <button class="btn primary block" type="submit">Create my account ${icon('arrowRight')}</button>
+      <p class="muted small">Already have a Kalinga account? Enter its email and password above to use this invite with it.</p>
+    </form>`);
+  busySubmit($('#join'), async (v) => {
+    const user = await joinWithInvite(token, v);
+    toast(`Welcome, ${user.fullName}!`);
+    await enterApp(user);
+  });
+}
+
+function pendingScreen(email) {
+  authLayout(`<div class="auth-card"><p class="eyebrow">Signed in as ${esc(email)}</p><h2>No access yet</h2>
+    <p class="muted">This account isn’t linked to Kalinga. Open the invite link from your administrator, or ask for a new one.</p>
+    <button class="btn block" id="out">Sign out</button></div>`);
+  $('#out').onclick = async () => { await sb.auth.signOut(); location.reload(); };
 }
 
 // ======================================================= shell
@@ -186,7 +256,7 @@ function renderShell() {
   $('#scrim').onclick = () => document.body.classList.remove('nav-open');
   $('#search').onclick = commandPalette;
   $('#theme').onclick = toggleTheme;
-  $('#logout').onclick = async () => { if (state.dirty && !confirm('Discard unsaved changes and sign out?')) return; state.dirty = false; await logout(state.user); location.hash = ''; location.reload(); };
+  $('#logout').onclick = async () => { if (state.dirty && !confirm('Discard unsaved changes and sign out?')) return; state.dirty = false; await logout(state.user); history.replaceState(null, '', location.pathname); location.reload(); };
   const net = () => { const el = $('#net'); if (!el) return; el.className = `net ${navigator.onLine ? 'on' : 'off'}`; el.textContent = navigator.onLine ? 'Online' : 'Offline'; };
   window.addEventListener('online', net); window.addEventListener('offline', net); net();
 }
@@ -221,9 +291,14 @@ const ROUTES = [
 ];
 
 async function route() {
-  const fresh = await currentUser();
-  if (!fresh) { toast('Your session has ended. Please sign in again.', 'warn'); return loginScreen(); }
-  state.user = fresh;
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) { toast('Your session has ended. Please sign in again.', 'warn'); return loginScreen(); }
+  if (Date.now() - state.checkedAt > 60000) {
+    const fresh = await currentUser().catch(() => state.user);
+    if (!fresh) { await sb.auth.signOut(); toast('Your account is no longer active.', 'err'); return loginScreen(); }
+    state.user = fresh;
+    state.checkedAt = Date.now();
+  }
   const path = location.hash.replace(/^#/, '').split('?')[0];
   const view = $('#view');
   document.body.classList.remove('nav-open');
@@ -252,7 +327,7 @@ async function dashboardView(view) {
   const people = new Map(data.people.map((p) => [p.id, p]));
   const recent = [...data.records].sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')).slice(0, 7);
   const lastBackup = await getSetting('lastBackupAt');
-  const backupOld = can(state.user, 'data.export') && data.records.length && (!lastBackup || Date.now() - new Date(lastBackup) > 7 * 864e5);
+  const backupOld = can(state.user, 'data.import') && data.records.length && (!lastBackup || Date.now() - new Date(lastBackup) > 30 * 864e5);
   const nut = st.learnerNutrition;
   const kpi = (href, label, val, sub, accent = '') => `<a class="kpi ${accent}" href="${href}"><span class="kpi-label">${label}</span><span class="kpi-val">${val}</span><span class="kpi-sub">${sub}</span></a>`;
 
@@ -270,7 +345,7 @@ async function dashboardView(view) {
       </div>
       ${PULSE}
     </section>
-    ${backupOld ? `<div class="banner warn">${icon('alert')}<span>${lastBackup ? `Last backup was ${fmtDate(lastBackup)}.` : 'No backup has been made yet.'} Records live in this browser — export a backup regularly so data can be restored or moved.</span><a class="btn sm" href="#/data">Back up now</a></div>` : ''}
+    ${backupOld ? `<div class="banner warn">${icon('alert')}<span>${lastBackup ? `Last off-line backup was ${fmtDate(lastBackup)}.` : 'No off-line backup has been made yet.'} Download one monthly and keep it on a division drive, in case the online database is ever lost.</span><a class="btn sm" href="#/data">Back up now</a></div>` : ''}
     ${!data.people.length ? `<div class="banner">${icon('spark')}<span>Start by adding schools in <a href="#/settings">Settings</a>, then add or import learners and personnel.</span></div>` : ''}
     <section class="kpis">
       ${kpi('#/people/learner', 'Learners', st.learners.toLocaleString(), `${nut.coveragePct}% assessed this SY`)}
@@ -491,7 +566,7 @@ async function personView(view, id) {
   const latestShd1 = records.find((r) => r.formId === 'shd1' && r.data.nutritionalStatus);
   const latestBP = records.find((r) => r.data.bpSys);
   const latestDental = records.find((r) => r.formId === 'shd2b');
-  const users = new Map((await db.all('users')).map((u) => [u.id, u]));
+  const users = await listStaffNames();
   const B = latestVitals ? bmi(latestVitals.data.weightKg, latestVitals.data.heightCm) : null;
   const snap = [
     ['Height / weight', latestVitals ? `${latestVitals.data.heightCm} cm · ${latestVitals.data.weightKg} kg` : '—', latestVitals && fmtDate(latestVitals.data.examDate)],
@@ -627,7 +702,7 @@ async function recordView(view, { id, formId, personId }) {
     const now = new Date().toISOString();
     const exam = data.examDate || data.referralDate || today();
     const rec = {
-      id: record.id, formId: form.id, personId: person.id, data,
+      id: record.id, _v: record._v, formId: form.id, personId: person.id, data,
       examDate: exam, schoolYear: data.schoolYear || currentSchoolYear(new Date(exam)),
       schoolId: person.schoolId || '',
       status: finalize ? 'final' : 'draft',
@@ -635,7 +710,11 @@ async function recordView(view, { id, formId, personId }) {
       updatedAt: now, updatedBy: state.user.id,
       ...(finalize ? { signedBy: { userId: state.user.id, name: state.user.fullName, license: state.user.license || '', role: state.user.role, at: now } } : {}),
     };
-    await db.put('records', rec);
+    try {
+      await db.put('records', rec);
+    } catch (err) {
+      return toast(err.message, 'err', err instanceof ConflictError ? 10000 : 6000);
+    }
     await audit(state.user, finalize ? 'record.sign' : record.isNew ? 'record.create' : 'record.update', `${form.code} · ${fullName(person)}`);
     state.dirty = false;
     toast(finalize ? 'Signed and finalized' : 'Saved');
@@ -719,9 +798,8 @@ async function printView(view, { id, formId }) {
 // ======================================================= records list
 async function recordsView(view) {
   const q = queryParams();
-  const [records, people, users] = await Promise.all([db.all('records'), db.all('people'), db.all('users')]);
+  const [records, people, U] = await Promise.all([db.all('records'), db.all('people'), listStaffNames()]);
   const P = new Map(people.map((p) => [p.id, p]));
-  const U = new Map(users.map((u) => [u.id, u]));
   const years = [...new Set([currentSchoolYear(), ...records.map((r) => r.schoolYear).filter(Boolean)])].sort().reverse();
   const f = { form: q.get('form') || '', status: q.get('status') || '', school: '', sy: '', text: '' };
   view.innerHTML = `
@@ -916,17 +994,26 @@ async function assistantView(view) {
 
 // ======================================================= data & backup
 async function dataView(view) {
-  const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
-  const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : false;
-  const counts = Object.fromEntries(await Promise.all(['people', 'records', 'users', 'schools', 'audit'].map(async (s) => [s, await db.count(s)])));
+  await db.refresh();
+  const counts = Object.fromEntries(await Promise.all(['people', 'records', 'schools'].map(async (s) => [s, await db.count(s)])));
   const lastBackup = await getSetting('lastBackupAt');
   const isAdmin = can(state.user, 'data.import');
+  const legacy = isAdmin ? await readLegacyLocal() : null;
   view.innerHTML = `
     ${pageHead('Portability &amp; safety', 'Data &amp; <em>backup</em>')}
+    ${legacy ? `<div class="banner">${icon('database')}<span>This browser still holds data from the earlier device-only version of Kalinga: <b>${(legacy.stores.people || []).length}</b> people and <b>${(legacy.stores.records || []).length}</b> records.</span><button class="btn sm primary" id="legacy">Upload to central database</button></div>` : ''}
     <section class="cards">
       <article class="card">
+        <header><h3>${icon('database')} Central database</h3><span class="badge ok">Connected</span></header>
+        <p class="muted small">Everyone signs in to the same Supabase database, so records are shared live across all computers and phones.</p>
+        <dl class="dl">
+          <dt>Project</dt><dd class="mono">${esc(new URL(SUPABASE_URL).hostname.split('.')[0])}</dd>
+          <dt>People</dt><dd>${counts.people.toLocaleString()}</dd><dt>Records</dt><dd>${counts.records.toLocaleString()}</dd><dt>Schools</dt><dd>${counts.schools}</dd>
+        </dl>
+      </article>
+      <article class="card">
         <header><h3>${icon('download')} Export backup</h3></header>
-        <p class="muted small">A single file containing every person, record, user account and setting. Use it to back up, or to move Kalinga to another computer or browser.</p>
+        <p class="muted small">Download a full copy of every person, record, school and setting. Keep one off-line, e.g. monthly on a division drive. User accounts are not included.</p>
         <form id="exp" class="stack">
           <label>Passphrase (recommended)<input type="password" name="pass" autocomplete="new-password" placeholder="Leave blank for an unencrypted file"></label>
           ${isAdmin ? '<label class="toggle"><input type="checkbox" name="key"> Include the AI API key</label>' : ''}
@@ -935,30 +1022,15 @@ async function dataView(view) {
         <p class="small muted">Last backup: <b>${lastBackup ? fmtDateTime(lastBackup) : 'never'}</b></p>
       </article>
       ${isAdmin ? `<article class="card">
-        <header><h3>${icon('upload')} Import / transfer in</h3></header>
-        <p class="muted small"><b>Merge</b> adds new items and keeps the newest copy of each record — use it to combine data encoded on different computers. <b>Replace</b> wipes this device first.</p>
-        <div class="stack"><button class="btn" id="merge">${icon('upload')} Merge a backup</button><button class="btn danger ghost" id="replace">${icon('upload')} Replace with a backup</button></div>
+        <header><h3>${icon('upload')} Import a backup</h3></header>
+        <p class="muted small">Adds the people, records and schools in a Kalinga backup file to the central database. Where a record exists in both, the more recently edited copy is kept. Nothing is deleted.</p>
+        <button class="btn" id="merge">${icon('upload')} Import backup file</button>
       </article>` : ''}
       <article class="card">
         <header><h3>${icon('file')} CSV templates</h3></header>
         <p class="muted small">Fill these in Excel or Google Sheets, then use <b>Import CSV</b> on the Learners or Personnel page. Columns can be in any order.</p>
         <div class="stack"><button class="btn" data-tpl="learner">${icon('download')} Learner template</button><button class="btn" data-tpl="personnel">${icon('download')} Personnel template</button></div>
       </article>
-      <article class="card">
-        <header><h3>${icon('database')} Storage on this device</h3></header>
-        <dl class="dl">
-          <dt>People</dt><dd>${counts.people.toLocaleString()}</dd><dt>Records</dt><dd>${counts.records.toLocaleString()}</dd>
-          <dt>Users</dt><dd>${counts.users}</dd><dt>Schools</dt><dd>${counts.schools}</dd><dt>Audit entries</dt><dd>${counts.audit.toLocaleString()}</dd>
-          ${est ? `<dt>Space used</dt><dd>${(est.usage / 1048576).toFixed(1)} MB of ${(est.quota / 1073741824).toFixed(1)} GB</dd>` : ''}
-          <dt>Protected from cleanup</dt><dd>${persisted ? '<span class="badge ok">Yes</span>' : '<span class="badge warn">No</span>'}</dd>
-        </dl>
-        ${persisted ? '' : `<button class="btn sm" id="persist">${icon('shield')} Ask browser to keep data</button>`}
-      </article>
-      ${isAdmin ? `<article class="card danger-zone">
-        <header><h3>${icon('alert')} Erase this device</h3></header>
-        <p class="muted small">Removes all Kalinga data from this browser. Export a backup first.</p>
-        <button class="btn danger" id="wipe">Erase all data…</button>
-      </article>` : ''}
     </section>`;
 
   $('#exp').onsubmit = async (e) => {
@@ -969,13 +1041,13 @@ async function dataView(view) {
     if (pass) data = await encryptJSON(data, pass);
     const name = `kalinga-backup-${(state.settings.division || 'division').replace(/\W+/g, '-').toLowerCase()}-${today()}${pass ? '.encrypted' : ''}.json`;
     download(name, JSON.stringify(data));
-    await setSetting('lastBackupAt', new Date().toISOString());
+    if (isAdmin) await setSetting('lastBackupAt', new Date().toISOString());
     await audit(state.user, 'data.export', pass ? 'encrypted' : 'unencrypted');
     toast(pass ? 'Encrypted backup downloaded. Keep the passphrase safe — it cannot be recovered.' : 'Backup downloaded. Store it somewhere safe; it contains health information.', 'ok', 6000);
     e.target.reset();
   };
-  $('#merge')?.addEventListener('click', () => restoreBackup(false, 'merge'));
-  $('#replace')?.addEventListener('click', () => restoreBackup(false, 'replace'));
+  $('#merge')?.addEventListener('click', () => restoreBackup());
+  $('#legacy')?.addEventListener('click', () => importBackup(legacy, 'this browser’s old local database'));
   $$('[data-tpl]').forEach((b) => (b.onclick = () => {
     const t = b.dataset.tpl;
     const sample = t === 'learner'
@@ -983,18 +1055,9 @@ async function dataView(view) {
       : [{ employeeNo: '1234567', lastName: 'Reyes', firstName: 'Ana', middleName: 'Lopez', sex: 'Female', birthdate: '1988-02-20', civilStatus: 'Married', position: 'Teacher III', bloodType: 'O+', contact: '09181234567', address: 'Brgy. Poblacion', school: state.schools[0]?.name || 'Sample National High School' }];
     download(`kalinga-${t}-template.csv`, toCSV(sample, [...PERSON_FIELDS[t].map((f) => ({ k: f.k, label: f.label })), { k: 'school', label: 'School' }]), 'text/csv');
   }));
-  $('#persist')?.addEventListener('click', async () => { toast((await requestPersistence()) ? 'The browser will keep Kalinga data.' : 'The browser declined. Install Kalinga as an app or bookmark it, then try again.', 'warn'); route(); });
-  $('#wipe')?.addEventListener('click', async () => {
-    const ok = await modal({ title: 'Erase all data?', body: '<p>This cannot be undone. Type <b>ERASE</b> to confirm.</p><input name="c" autocomplete="off">', actions: [{ label: 'Cancel', value: false }, { label: 'Erase everything', kind: 'danger', submit: true }], onSubmit: (f) => (f.elements.c.value === 'ERASE' ? true : (toast('Type ERASE to confirm.', 'err'), undefined)) });
-    if (!ok) return;
-    await wipeAll();
-    sessionStorage.clear();
-    location.hash = '';
-    location.reload();
-  });
 }
 
-async function restoreBackup(firstRun, mode = 'replace') {
+async function restoreBackup() {
   const file = await pickFile('.json,application/json');
   if (!file) return;
   let data;
@@ -1005,66 +1068,115 @@ async function restoreBackup(firstRun, mode = 'replace') {
     try { data = await decryptJSON(data, pass); } catch (err) { return toast(err.message, 'err'); }
   }
   if (data.app !== 'kalinga') return toast('This file is not a Kalinga backup.', 'err');
+  return importBackup(data, `the backup from ${fmtDateTime(data.exportedAt)}`);
+}
+
+async function importBackup(data, source) {
   const n = (k) => (data.stores?.[k] || []).length.toLocaleString();
-  const ok = await confirmBox(`${mode === 'merge' ? 'Merge' : 'Restore'} backup?`, `Backup from <b>${fmtDateTime(data.exportedAt)}</b>: ${n('people')} people, ${n('records')} records, ${n('users')} users, ${n('schools')} schools.${mode === 'replace' && !firstRun ? '<br><br><b>All current data on this device will be replaced.</b>' : ''}`, mode === 'merge' ? 'Merge' : 'Restore', mode === 'replace' && !firstRun);
+  const ok = await confirmBox('Import into the central database?', `From ${esc(source)}: <b>${n('people')}</b> people, <b>${n('records')}</b> records, <b>${n('schools')}</b> schools.<br><br>Everyone will see these right away. Existing data is kept; for records in both places, the more recently edited copy wins. User accounts are not imported — send invite links instead.`, 'Import');
   if (!ok) return;
+  const progress = toastProgress('Uploading…');
   try {
-    const summary = await importAll(data, mode);
-    if (!firstRun) await audit(state.user, `data.import.${mode}`, JSON.stringify(summary));
-    toast(`${mode === 'merge' ? 'Merged' : 'Restored'}: ${summary.people} people, ${summary.records} records.`);
-    if (firstRun || mode === 'replace') { sessionStorage.clear(); location.hash = ''; location.reload(); } else { await loadSettings(); route(); }
-  } catch (err) { toast(err.message, 'err', 7000); }
+    const summary = await importAll(data, (store, done, total) => progress(`Uploading ${store}: ${done.toLocaleString()} of ${total.toLocaleString()}`));
+    await audit(state.user, 'data.import', JSON.stringify(summary));
+    progress(null);
+    toast(`Imported ${summary.people} people, ${summary.records} records, ${summary.schools} schools.`, 'ok', 6000);
+    await loadSettings(true);
+    renderShell(); route();
+  } catch (err) { progress(null); toast(err.message, 'err', 8000); }
+}
+
+// A persistent status toast for long uploads; call with null to remove it.
+function toastProgress(text) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = '<span class="spinner"></span><span></span>';
+  $('#toasts').append(el);
+  const set = (t) => { if (t === null) el.remove(); else el.lastChild.textContent = t; };
+  set(text);
+  return set;
 }
 
 // ======================================================= users
 async function usersView(view) {
-  const users = [...(await db.all('users'))].sort((a, b) => a.fullName.localeCompare(b.fullName));
+  const [users, invites] = await Promise.all([listUsers(), listInvites()]);
+  const now = new Date().toISOString();
+  const open = invites.filter((i) => !i.revoked && !i.used_at && i.expires_at > now);
   view.innerHTML = `
-    ${pageHead('Accounts &amp; roles', '<em>Users</em>', `<button class="btn primary" id="add">${icon('plus')} Add user</button>`)}
+    ${pageHead('Accounts &amp; roles', '<em>Users</em>', `<button class="btn primary" id="add">${icon('plus')} Invite staff</button>`)}
+    <article class="card">
+      <header><h3>${icon('send')} Open invite links</h3><span class="muted small">Each link works once and expires automatically</span></header>
+      ${open.length ? `<div class="table-wrap"><table class="table compact"><thead><tr><th>Role</th><th>For</th><th>Expires</th><th></th></tr></thead><tbody id="invites">
+        ${open.map((i) => `<tr><td>${esc(ROLES[i.role].label)}</td><td>${esc(i.email || i.note || 'Anyone with the link')}</td><td>${fmtDate(i.expires_at)}</td>
+          <td class="right"><button class="btn sm" data-copy="${i.token}">${icon('clipboard')} Copy link</button><button class="btn sm ghost danger" data-revoke="${i.token}">Revoke</button></td></tr>`).join('')}
+      </tbody></table></div>` : '<p class="muted small">No open invites. Use <b>Invite staff</b> to create a link for a doctor, dentist, nurse or another administrator.</p>'}
+    </article>
     <div class="role-legend">
       <div><b>Administrator / Developer</b><small>Everything, including users, settings, backups, audit log and unlocking signed records.</small></div>
       <div><b>Physician</b><small>Encodes all forms; signs medical certificates, Annual PE and Palaro clearances.</small></div>
       <div><b>Dentist</b><small>Encodes all forms; signs dental records and referral slips.</small></div>
       <div><b>Nurse</b><small>Encodes all forms and finalizes health records; certificates wait for a physician or dentist.</small></div>
     </div>
-    <div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>License no.</th><th>Last sign-in</th><th>Status</th><th></th></tr></thead>
-    <tbody>${users.map((u) => `<tr><td><span class="person-cell"><span class="avatar sm">${esc(initials(u.fullName))}</span><b>${esc(u.fullName)}</b></span></td><td class="mono">${esc(u.username)}</td><td>${esc(ROLES[u.role]?.label)}</td><td>${esc(u.license || '—')}</td><td>${u.lastLogin ? fmtDateTime(u.lastLogin) : 'Never'}</td>
+    <div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>License no.</th><th>Last sign-in</th><th>Status</th><th></th></tr></thead>
+    <tbody id="users">${users.map((u) => `<tr><td><span class="person-cell"><span class="avatar sm">${esc(initials(u.fullName))}</span><b>${esc(u.fullName)}</b></span></td><td>${esc(u.email)}</td><td>${esc(ROLES[u.role]?.label)}</td><td>${esc(u.license || '—')}</td><td>${u.lastLogin ? fmtDateTime(u.lastLogin) : 'Never'}</td>
       <td>${u.active === false ? '<span class="badge">Disabled</span>' : '<span class="badge ok">Active</span>'}</td>
       <td class="right"><button class="btn sm ghost" data-edit="${u.id}">${icon('edit')}</button><button class="btn sm ghost" data-pw="${u.id}" data-tip="Reset password">${icon('key')}</button></td></tr>`).join('')}</tbody></table></div>`;
   const userForm = (u = {}) => `<div class="grid2">
       <label class="span-2">Full name (as printed on forms)<input name="fullName" required value="${esc(u.fullName)}"></label>
-      ${u.id ? '' : '<label>Username<input name="username" required autocomplete="off"></label><label>Temporary password<input name="password" type="password" required autocomplete="new-password" minlength="8"></label>'}
       <label>Role<select name="role">${optionList(Object.entries(ROLES).map(([k, r]) => [k, r.label]), u.role || 'nurse')}</select></label>
       <label>PRC license no.<input name="license" value="${esc(u.license)}" placeholder="Required for signing"></label>
       <label class="span-2">Position / designation<input name="position" value="${esc(u.position)}" placeholder="e.g. Medical Officer III"></label>
-      ${u.id ? `<label class="toggle span-2"><input type="checkbox" name="active" ${u.active !== false ? 'checked' : ''}> Account active</label>` : ''}
+      <label class="toggle span-2"><input type="checkbox" name="active" ${u.active !== false ? 'checked' : ''}> Account active</label>
     </div>`;
+  const shareInvite = (token, role) => modal({
+    title: 'Invite link ready',
+    body: `<p>Send this link to the ${esc(ROLES[role].label.toLowerCase())} by Messenger, SMS or email. It opens a page where they create their own password.</p>
+      <div class="invite-link"><input readonly value="${esc(inviteLink(token))}" id="il"><button type="button" class="btn primary" id="ilc">${icon('clipboard')} Copy</button></div>
+      <p class="muted small">The link works once. Anyone who has it can join with this role until it is used or expires, so share it only with the intended person.</p>`,
+    onOpen: (dlg) => {
+      dlg.querySelector('#il').onfocus = (e) => e.target.select();
+      dlg.querySelector('#ilc').onclick = () => navigator.clipboard.writeText(inviteLink(token)).then(() => toast('Invite link copied'));
+    },
+  });
   $('#add').onclick = async () => {
-    const ok = await modal({ title: 'Add user', wide: true, body: userForm(), actions: [{ label: 'Cancel', value: null }, { label: 'Create account', kind: 'primary', submit: true }],
-      onSubmit: async (f) => { await createUser(Object.fromEntries(new FormData(f)), state.user); return true; } });
-    if (ok) { toast('User created. Share the temporary password privately.'); route(); }
+    const inv = await modal({
+      title: 'Invite staff', wide: true,
+      body: `<div class="grid2">
+        <label>Role<select name="role">${optionList(Object.entries(ROLES).map(([k, r]) => [k, r.label]), 'nurse')}</select></label>
+        <label>Link expires in<select name="days">${optionList([['1', '1 day'], ['3', '3 days'], ['7', '7 days'], ['30', '30 days']], '7')}</select></label>
+        <label class="span-2">Their email (optional — only this email can use the link)<input type="email" name="email" placeholder="name@deped.gov.ph"></label>
+        <label class="span-2">Note for your reference<input name="note" placeholder="e.g. Nurse Reyes – District II"></label>
+      </div>`,
+      actions: [{ label: 'Cancel', value: null }, { label: 'Create invite link', kind: 'primary', submit: true }],
+      onSubmit: async (f) => createInvite({ role: f.elements.role.value, email: f.elements.email.value, days: +f.elements.days.value, note: f.elements.note.value }, state.user),
+    });
+    if (!inv) return;
+    await shareInvite(inv.token, inv.role);
+    route();
   };
-  view.querySelector('tbody').onclick = async (e) => {
+  $('#invites')?.addEventListener('click', async (e) => {
+    const c = e.target.closest('[data-copy]'), r = e.target.closest('[data-revoke]');
+    if (c) { const i = invites.find((x) => x.token === c.dataset.copy); shareInvite(i.token, i.role); }
+    if (r && (await confirmBox('Revoke invite?', 'The link will stop working immediately.', 'Revoke', true))) { await revokeInvite(r.dataset.revoke, state.user); route(); }
+  });
+  $('#users').onclick = async (e) => {
     const eb = e.target.closest('[data-edit]'), pb = e.target.closest('[data-pw]');
     if (eb) {
       const u = users.find((x) => x.id === eb.dataset.edit);
-      const ok = await modal({ title: `Edit ${u.username}`, wide: true, body: userForm(u), actions: [{ label: 'Cancel', value: null }, { label: 'Save', kind: 'primary', submit: true }],
+      const ok = await modal({ title: `Edit ${u.fullName}`, wide: true, body: userForm(u), actions: [{ label: 'Cancel', value: null }, { label: 'Save', kind: 'primary', submit: true }],
         onSubmit: async (f) => {
           const v = Object.fromEntries(new FormData(f));
           const active = !!v.active;
-          const admins = users.filter((x) => x.role === 'admin' && x.active !== false && x.id !== u.id);
-          if (u.role === 'admin' && (v.role !== 'admin' || !active) && !admins.length) throw new Error('Keep at least one active administrator.');
           if (u.id === state.user.id && !active) throw new Error('You cannot disable your own account.');
-          await db.put('users', { ...u, fullName: v.fullName.trim(), role: v.role, license: v.license.trim(), position: v.position.trim(), active });
-          await audit(state.user, 'user.update', `${u.username} → ${ROLES[v.role].label}${active ? '' : ' (disabled)'}`);
+          await updateUser(u.id, { ...v, active }, state.user);
           return true;
         } });
-      if (ok) { toast('Saved'); route(); }
+      if (ok) { toast('Saved'); state.checkedAt = 0; route(); }
     }
     if (pb) {
       const u = users.find((x) => x.id === pb.dataset.pw);
-      const ok = await modal({ title: `Reset password for ${u.username}`, body: '<label>New temporary password<input type="password" name="p" required minlength="8" autocomplete="new-password"></label><p class="muted small">The user will be reminded to change it.</p>', actions: [{ label: 'Cancel', value: null }, { label: 'Reset', kind: 'primary', submit: true }],
-        onSubmit: async (f) => { await setPassword(u, f.elements.p.value, state.user); return true; } });
+      const ok = await modal({ title: `Reset password for ${u.fullName}`, body: '<label>New temporary password<input type="password" name="p" required minlength="8" autocomplete="new-password"></label><p class="muted small">Tell them the temporary password privately. They will be reminded to change it.</p>', actions: [{ label: 'Cancel', value: null }, { label: 'Reset', kind: 'primary', submit: true }],
+        onSubmit: async (f) => { await adminSetPassword(u, f.elements.p.value, state.user); return true; } });
       if (ok) toast('Password reset');
     }
   };
@@ -1144,7 +1256,7 @@ async function settingsView(view) {
     toast('AI settings saved');
     route();
   };
-  $('#rmKey')?.addEventListener('click', async () => { await db.del('settings', 'apiKey'); await audit(state.user, 'settings.ai', 'key removed'); await loadSettings(); route(); });
+  $('#rmKey')?.addEventListener('click', async () => { await setSetting('apiKey', ''); await audit(state.user, 'settings.ai', 'key removed'); await loadSettings(); route(); });
   $('#test').onclick = async () => {
     const out = $('#testOut');
     out.className = 'small muted';
@@ -1186,7 +1298,7 @@ async function settingsView(view) {
 
 // ======================================================= audit
 async function auditView(view) {
-  const rows = [...(await db.all('audit'))].sort((a, b) => b.at.localeCompare(a.at));
+  const rows = await readAudit();
   view.innerHTML = `
     ${pageHead('Accountability', 'Audit <em>log</em>', `<button class="btn" id="exp">${icon('download')} Export CSV</button>`)}
     <div class="toolbar"><label class="search">${icon('search')}<input id="q" placeholder="Filter by user, action or detail…"></label><span class="muted" id="count"></span></div>
@@ -1231,9 +1343,8 @@ async function accountView(view) {
     e.preventDefault();
     const f = e.target;
     if (!f.reportValidity()) return;
+    await updateUser(u.id, { fullName: f.elements.fullName.value, license: f.elements.license.value, position: f.elements.position.value }, u);
     Object.assign(u, { fullName: f.elements.fullName.value.trim(), license: f.elements.license.value.trim(), position: f.elements.position.value.trim() });
-    await db.put('users', u);
-    await audit(u, 'user.profile');
     toast('Profile saved');
     renderShell(); route();
   };
@@ -1241,17 +1352,12 @@ async function accountView(view) {
     e.preventDefault();
     const f = e.target;
     if (f.elements.new.value !== f.elements.rep.value) return toast('The new passwords do not match.', 'err');
-    const problem = passwordProblem(f.elements.new.value);
-    if (problem) return toast(problem, 'err');
     try {
-      await login(u.username, f.elements.cur.value);
-      const fresh = await db.get('users', u.id);
-      await setPassword(fresh, f.elements.new.value);
-      fresh.mustChange = false;
-      await db.put('users', fresh);
+      await changeOwnPassword(u, f.elements.cur.value, f.elements.new.value);
+      u.mustChange = false;
       toast('Password changed');
       f.reset();
-    } catch (err) { toast(err.message === 'Incorrect username or password.' ? 'Current password is incorrect.' : err.message, 'err'); }
+    } catch (err) { toast(err.message, 'err'); }
   };
 }
 

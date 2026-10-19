@@ -164,6 +164,10 @@ input[type="file"] { padding: 7px; }
 .auth-panel { display: grid; place-items: center; padding: 32px 16px; }
 .auth-card { width: min(440px, 100%); display: grid; gap: 14px; }
 .auth-card h2 { font-size: 36px; }
+.auth-card h2 em { font-style: italic; color: var(--brand); }
+.steps { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
+.invite-link { display: flex; gap: 8px; }
+.invite-link input { font-family: var(--mono); font-size: 12.5px; }
 .brand-mark { display: flex; align-items: center; gap: 12px; color: var(--side-ink-strong); font: 400 28px var(--display); text-decoration: none !important; }
 .brand-mark small { display: block; font: 500 11px var(--font); letter-spacing: .06em; color: var(--side-ink); opacity: .85; margin-top: 2px; }
 
